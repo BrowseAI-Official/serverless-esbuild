@@ -35,7 +35,7 @@ export interface Configuration extends EsbuildOptions {
   zipConcurrency?: number;
   packager: PackagerId;
   packagerOptions: PackagerOptions;
-  packagePath: string;
+  packagePath: string | string[];
   exclude: '*' | string[];
   nativeZip: boolean;
   watch: WatchConfiguration;

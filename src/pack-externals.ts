@@ -12,7 +12,7 @@ import { getPackager } from './packagers';
 import { findProjectRoot, findUp } from './utils';
 import type EsbuildServerlessPlugin from './index';
 import type { JSONObject, PackageJSON } from './types';
-import { assertIsString } from './helper';
+import { asArray, assertIsString } from './helper';
 
 function rebaseFileReferences(pathToPackageRoot: string, moduleVersion: string) {
   if (/^(?:file:[^/]{2}|\.\/|\.\.\/)/.test(moduleVersion)) {
@@ -211,7 +211,7 @@ export function nodeExternalsPluginUtilsPath(): string | undefined {
  * This will utilize the npm cache at its best and give us the needed results
  * and performance.
  */
-// eslint-disable-next-line max-statements
+// eslint-disable-next-line max-statements, complexity
 export async function packExternalModules(this: EsbuildServerlessPlugin) {
   assert(this.buildOptions, 'buildOptions not defined');
 
@@ -262,11 +262,23 @@ export async function packExternalModules(this: EsbuildServerlessPlugin) {
   const rootPackageJsonPath = path.join(findProjectRoot() || '', './package.json');
   // get the local package.json by looking up until we hit a package.json file
   // if this is *not* a yarn workspace, it will be the same as rootPackageJsonPath
-  const packageJsonPath =
-    this.buildOptions.packagePath ||
-    (upperPackageJson && path.relative(process.cwd(), path.join(upperPackageJson, './package.json')));
+  const configuredPackagePaths = this.buildOptions.packagePath;
 
-  assert(packageJsonPath, 'packageJsonPath is not defined');
+  const fallbackPackagePath =
+    upperPackageJson && path.relative(process.cwd(), path.join(upperPackageJson, './package.json'));
+
+  // eslint-disable-next-line no-nested-ternary
+  const packageJsonPaths = configuredPackagePaths
+    ? asArray(configuredPackagePaths)
+    : fallbackPackagePath
+    ? [fallbackPackagePath]
+    : [];
+
+  const uniquePackageJsonPaths = R.uniq(packageJsonPaths.filter((value): value is string => Boolean(value)));
+
+  assert(uniquePackageJsonPaths.length > 0, 'packageJsonPath is not defined');
+
+  const [primaryPackageJsonPath] = uniquePackageJsonPaths;
 
   // Determine and create packager
   const packager = await getPackager.call(this, this.buildOptions.packager, this.buildOptions.packagerOptions);
@@ -295,7 +307,7 @@ export async function packExternalModules(this: EsbuildServerlessPlugin) {
   const isWorkspace = !!rootPackageJson.workspaces;
 
   const packageJson: Record<string, unknown> = isWorkspace
-    ? (packageJsonPath && this.serverless.utils.readFileSync(packageJsonPath)) || {}
+    ? (primaryPackageJsonPath && this.serverless.utils.readFileSync(primaryPackageJsonPath)) || {}
     : rootPackageJson;
 
   const packageSections = R.pick(sectionNames, packageJson);
@@ -309,8 +321,25 @@ export async function packExternalModules(this: EsbuildServerlessPlugin) {
 
   // (1) Generate dependency composition
   const externalModules = R.map((external) => ({ external }), externals);
-  const compositeModules: JSONObject = R.uniq(
-    getProdModules.call(this, externalModules, packageJsonPath, rootPackageJsonPath)
+  const externalModulesByPath = uniquePackageJsonPaths.map((packageJsonPath) => {
+    const modules = Array.from(
+      new Set(getProdModules.call(this, externalModules, packageJsonPath, rootPackageJsonPath))
+    );
+
+    return {
+      packageJsonPath,
+      modules,
+    };
+  });
+
+  const compositeModules = Array.from(
+    new Set(
+      externalModulesByPath.reduce<string[]>((acc, { modules }) => {
+        acc.push(...modules);
+
+        return acc;
+      }, [])
+    )
   );
 
   if (R.isEmpty(compositeModules)) {
@@ -338,13 +367,20 @@ export async function packExternalModules(this: EsbuildServerlessPlugin) {
     },
     packageSections
   );
-  const relativePath = path.relative(compositeModulePath, path.dirname(packageJsonPath));
 
-  addModulesToPackageJson(compositeModules, compositePackage, relativePath);
+  externalModulesByPath.forEach(({ packageJsonPath, modules }) => {
+    if (!modules.length) {
+      return;
+    }
+
+    const relativePath = path.relative(compositeModulePath, path.dirname(packageJsonPath));
+
+    addModulesToPackageJson(modules, compositePackage, relativePath);
+  });
   this.serverless.utils.writeFileSync(compositePackageJson, JSON.stringify(compositePackage, null, 2));
 
   // (1.a.2) Copy package-lock.json if it exists, to prevent unwanted upgrades
-  const packageLockPath = path.join(process.cwd(), path.dirname(packageJsonPath), packager.lockfileName);
+  const packageLockPath = path.join(process.cwd(), packager.lockfileName);
   const exists = await fse.pathExists(packageLockPath);
 
   if (exists) {
@@ -352,7 +388,7 @@ export async function packExternalModules(this: EsbuildServerlessPlugin) {
     try {
       let packageLockFile = this.serverless.utils.readFileSync(packageLockPath);
 
-      packageLockFile = packager.rebaseLockfile(relativePath, packageLockFile);
+      packageLockFile = packager.rebaseLockfile(process.cwd(), packageLockFile);
       if (R.is(Object)(packageLockFile)) {
         packageLockFile = JSON.stringify(packageLockFile, null, 2);
       }
